@@ -1,7 +1,68 @@
 import numpy as np
 import networkx as nx
+from networkx.algorithms import community
 from cdlib import algorithms, evaluation
 from collections import defaultdict
+
+TYPE_MAPPING = {
+    'author': 'A',
+    'paper': 'P',
+    'venue': 'V',
+    'writes': 'P',    # 作者→论文的边类型映射为P
+    'be_writen':'A',
+    'cited_in':'→P',
+    'cites' : 'P←',
+    'published_in': 'V',  # 论文→会议的边类型映射为V
+    'publish' : 'P',
+    'has_keyword' : 'K',
+    'keyword_in' : 'P'
+}
+
+import networkx as nx
+
+def convert_hetero_graph_to_networkx(hetero_dict):
+    """将字典格式的异构图转换为 networkx.MultiDiGraph"""
+    G = nx.MultiDiGraph()
+    
+    # 添加节点并标注类型
+    for node_type, nodes in hetero_dict.items():
+        if node_type != 'edges':  # 排除edges键
+            for node in nodes:
+                G.add_node(node, type=node_type)
+    
+    # 添加边并标注关系类型
+    for edge in hetero_dict['edges']:
+        u, v, relation_type = edge
+        G.add_edge(u, v, relation=relation_type)
+    
+    return G
+
+def process_nested_community(community_list):
+    """
+    处理特殊嵌套结构的社区数据
+    :param community_list: [{'author': {...}, 'paper': {...}, ...}]
+    :return: 节点集合列表
+    """
+    combine_list=[]
+    for community_dict in community_list:
+    # if len(community_list) != 1 or not isinstance(community_list[0], dict):
+    #     raise ValueError("输入必须为包含单个字典的列表")
+    
+    # community_dict = community_list[0]
+        processed = []
+        
+        # 方案1：合并所有类型节点到一个社区
+        combined = set()
+        # 方案2：按类型分开为多个社区
+        separated = []
+        
+        for node_type, nodes in community_dict.items():
+            if node_type != 'edges' and nodes:  # 过滤掉edges和空集合
+                combined.update(nodes)
+                separated.append(nodes)
+        combine_list.append(combined)
+        
+    return combine_list
 
 def build_multiplex_network(hetero_graph, central_node_type, meta_paths):
     """
@@ -20,13 +81,36 @@ def build_multiplex_network(hetero_graph, central_node_type, meta_paths):
         for u in hetero_graph[central_node_type]:
             for v in hetero_graph[central_node_type]:
                 if u != v:
-                    # 假设存在元路径实例（实际需遍历路径计算）（特点是节点的类型不同）
-                    weight = np.random.rand()  # 用随机权重模拟公式(1)(2)
-                    G.add_edge(u, v, weight=weight)
-        multiplex_net[layer_name] = G
+                    instances = find_path_instances(u, v, path, hetero_graph)
+                    if instances:
+                        weight = sum(1/len(path) for path in instances) #权重是路径条数
+                        G.add_edge(u, v, weight=weight)
+                        multiplex_net[layer_name] = G
+                        print(G)
     return multiplex_net
 
+def find_path_instances(u, v, meta_path, graph):
+    """严格实现元路径实例查找"""
+    path_types = meta_path.replace('←', '-←').replace('→', '-→').split('-')  #处理含有箭头的元路径
+    instances = []
+    
+    def dfs(current, path, remaining_types): #DFS深度优先搜索算法查找实例
+            if len(remaining_types) == 0:
+                if current == v:
+                    instances.append(path)
+                return
+            rel_type= remaining_types[0]
 
+            for edge in graph['edges']:
+                if rel_type == '→P' and edge[0] == current and TYPE_MAPPING[edge[2]] == rel_type:
+                    dfs(edge[1], path + [edge], remaining_types[1:])
+                elif rel_type == 'P←' and edge[1] == current and TYPE_MAPPING[edge[2]] == rel_type:
+                    dfs(edge[0], path + [edge], remaining_types[1:])
+                elif edge[0] == current and TYPE_MAPPING[edge[2]] == rel_type:  #映射边的类型和元路径节点
+                    dfs(edge[1], path + [edge], remaining_types[1:]) 
+    
+    dfs(u, [], path_types[1:])  # 第一个类型已由u确定
+    return instances
 
 def detect_seed_communities(multiplex_net):
     """
@@ -57,9 +141,11 @@ def detect_seed_communities(multiplex_net):
                         total_weight += weight
                 if total_weight > 0:
                     consensus_graph.add_edge(u, v, weight=total_weight)
+    print(f'共识图：{consensus_graph}')
     
     # Step 3: 在共识图上再次检测社区
     seed_communities = algorithms.louvain(consensus_graph).communities
+    print(f'种子社区：{[set(c) for c in seed_communities]}')
     """
     为什么转换为 set？
     高效成员检查：集合（set）的成员检查（x in set）是 O(1) 时间复杂度，而列表（list）是 O(n)。在社区检测中，频繁需要检查节点是否属于某个社区（如 if node in community），用集合更高效。
@@ -104,7 +190,7 @@ def seed_expansion(hetero_graph, seed_communities, central_node_type,adjacency_l
                         best_seeds = [seed_node]
                     elif sim == max_sim:
                         best_seeds.append(seed_node) #找到和该节点相似值最大的种子节点并加入到best_seeds的队列中
-                if max_sim > 0:
+                if max_sim > 0.8:
                     community[node_type].add(node)#如果最大相似度大于0了，就将该节点归入到该类型节点的社区中
         
         final_communities.append(community)
@@ -130,36 +216,89 @@ def build_adjacency_list(hetero_graph):
         adj[v].add(u)
     return adj
 
+def overlapping_modularity(G, communities):
+    """适用于有向多关系图的简化模块度计算（忽略方向性和关系类型）"""
+    A = nx.to_numpy_array(G)  # 自动忽略边属性
+    m = G.number_of_edges()
+    nodes = list(G.nodes())
+    node_index = {n: i for i, n in enumerate(nodes)}
+    Q = 0.0
+
+    # 计算O_v（节点所属社区数）
+    O = {n: 0 for n in nodes}
+    for comm in communities:
+        for n in comm:
+            O[n] += 1
+
+    # 遍历社区和节点对
+    for comm in communities:
+        for v in comm:
+            for w in comm:
+                if v == w:
+                    continue
+                i, j = node_index[v], node_index[w]
+                kv = G.out_degree(v)  # 有向图的出度
+                kw = G.in_degree(w)   # 有向图的入度
+                Q += (A[i][j] - (kv * kw) / (2 * m)) / (O[v] * O[w])
+
+    return Q / (2 * m)
+
 def evaluate_communities(hetero_graph, communities):
-    """实现论文中的评估指标"""
-    results = {}
+    results={}
+    G = convert_hetero_graph_to_networkx(hetero_graph)
+    C=process_nested_community(communities)
+    print("图中所有节点:", G.nodes())
+    M=overlapping_modularity(G, C)
+    results['modularity']=M
     
-    # 1. 重叠模块度Q
-    try:
-        q = evaluation.newman_girvan_modularity(
-            nx.Graph([(u,v) for u,v,_ in hetero_graph['edges']]),
-            [list(c['author']) for c in communities]
-        ).score
-        results['modularity'] = q
-    except:
-        results['modularity'] = 0
-        print('Something is wrong when calculating the modularity!')
-    
-    # 2. 社区内关键词相关性 (简化实现)
+    # 3. 计算关键词相关性
     keyword_coherence = []
     for com in communities:
-        papers = com['paper']
+        papers = com.get('paper', [])
         keywords = defaultdict(int)
-        for p in papers:
-            for u, v, t in hetero_graph['edges']:
-                if u == p and t == 'has_keyword':
-                    keywords[v] += 1
-        if len(keywords) > 0:
+        for (u, v, edge_type) in hetero_graph['edges']:
+            if edge_type == 'has_keyword' and u in papers:
+                keywords[v] += 1
+        if keywords:
             avg_coherence = sum(keywords.values()) / len(keywords)
             keyword_coherence.append(avg_coherence)
     results['keyword_coherence'] = np.mean(keyword_coherence) if keyword_coherence else 0
     
     return results
+
+# def evaluate_communities(hetero_graph, communities):
+#     """实现论文中的评估指标"""
+#     results = {}
+    
+#     # 1. 重叠模块度Q
+#     # try:
+#     #     q = evaluation.newman_girvan_modularity(
+#     #         nx.Graph([(u,v) for u,v,_ in hetero_graph['edges']]),
+#     #         [list(c['author']) for c in communities]
+#     #     ).score
+#     #     results['modularity'] = q
+#     # except:
+#     #     results['modularity'] = 0
+#     #     print('Something is wrong when calculating the modularity!')
+
+#     modularity = community.modularity(hetero_graph, communities)
+#     print(f"Modularity: {modularity}")
+    
+#     # 2. 社区内关键词相关性 (简化实现)
+#     keyword_coherence = []
+#     for com in communities:
+#         papers = com['paper']
+#         keywords = defaultdict(int)
+#         for p in papers:
+#             for u, v, t in hetero_graph['edges']:
+#                 if u == p and t == 'has_keyword':
+#                     keywords[v] += 1
+#         if len(keywords) > 0:
+#             avg_coherence = sum(keywords.values()) / len(keywords)
+#             keyword_coherence.append(avg_coherence)
+#     results['keyword_coherence'] = np.mean(keyword_coherence) if keyword_coherence else 0
+    
+#     return results
 
 def run_experiments():
     """运行完整实验"""
@@ -175,40 +314,61 @@ def run_experiments():
             ('a2', 'p2', 'writes'), ('a2', 'p3', 'writes'),
             ('a3', 'p3', 'writes'), ('a3', 'p4', 'writes'),
             ('a4', 'p4', 'writes'), ('a4', 'p5', 'writes'),
+
+            #反向关系
+            ('p1', 'a1', 'be_writen'), ('p2', 'a1', 'be_writen'),
+            ('p2', 'a2', 'be_writen'), ('p3', 'a2', 'be_writen'),
+            ('p3', 'a3', 'be_writen'), ('p4', 'a3', 'be_writen'),
+            ('p4', 'a4', 'be_writen'), ('p5', 'a4', 'be_writen'),
             
             # 论文-会议关系 (发表)
             ('p1', 'v1', 'published_in'), ('p2', 'v1', 'published_in'),
             ('p3', 'v2', 'published_in'), ('p4', 'v2', 'published_in'),
             ('p5', 'v1', 'published_in'),
+
+            # 反向论文-会议关系 (发表)
+            ('v1', 'p1', 'publish'), ('v1', 'p2', 'publish'),
+            ('v2', 'p3', 'publish'), ('v2', 'p4', 'publish'),
+            ('v1', 'p5', 'publish'),
             
             # 论文-关键词关系
             ('p1', 'k1', 'has_keyword'), ('p1', 'k2', 'has_keyword'),
             ('p2', 'k1', 'has_keyword'), ('p2', 'k3', 'has_keyword'),
             ('p3', 'k2', 'has_keyword'), ('p3', 'k3', 'has_keyword'),
             ('p4', 'k1', 'has_keyword'), ('p5', 'k2', 'has_keyword'),
+
+             # 反向论文-关键词关系
+            ('k1', 'p1', 'keyword_in'), ('k2', 'p1', 'keyword_in'),
+            ('k1', 'p2', 'keyword_in'), ('k3', 'p2', 'keyword_in'),
+            ('k2', 'p3', 'keyword_in'), ('k3', 'p3', 'keyword_in'),
+            ('k1', 'p4', 'keyword_in'), ('k2', 'p5', 'keyword_in'),
             
             # 论文-论文引用关系
             ('p2', 'p1', 'cites'), ('p3', 'p2', 'cites'),
-            ('p4', 'p3', 'cites'), ('p5', 'p1', 'cites')
+            ('p4', 'p3', 'cites'), ('p5', 'p1', 'cites'),
+
+            # 反向论文-论文引用关系
+            ('p1', 'p2', 'cited_in'), ('p2', 'p3', 'cited_in'),
+            ('p3', 'p4', 'cited_in'), ('p1', 'p5', 'cited_in')
         ]
     }
     # 定义元路径
     author_meta_paths = [
-        'A - P → P - A ',       # author citation
-        'A - P - A',   # co-author
-        'A - P - V - P - A',    # authors with same journal/conference
-        'A - P → P ← P - A',    # authors’ co-citation
-        'A - P ← P → P - A ',    # author citations
-        'A - P - K - P - A',    # authors with same keywords
+        'A-P→P-A',       # author citation
+        'A-P-A',   # co-author
+        'A-P-V-P-A',    # authors with same journal/conference
+        'A-P→P←P-A',    # authors’ co-citation
+        'A-P←P→P-A',    # author citations
+        'A-P-K-P-A'    # authors with same keywords
     ]
 
     paper_meta_paths = [
-        'P → P ',       # citation relations
-        'P → P ← P',   # co-citation
-        'P ← P → P',    # citations
-        'P - A - P',    # with same author
-        'P - K - P',    # with same keyword
-        'P - V - P',    # with same journal/conference
+        'P→P',       # citation relations
+        'P→P←P',   # co-citation
+        'P←P→P',    # citations
+        'P-A-P',    # with same author
+        'P-K-P',    # with same keyword
+        'P-V-P'   # with same journal/conference
     ]
 
     # 预处理（只需执行一次）
